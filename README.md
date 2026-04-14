@@ -15,12 +15,7 @@ NCMFR/
 ├── utils.py          # Loss functions and utilities
 ├── parse.py          # Hyperparameter configurations
 └── dataset/          # Data directory (not included)
-    └── <dataset>/
-        ├── train.npy    # UU social links (train split)
-        ├── val.npy      # UU social links (val split)
-        ├── test.npy     # UU social links (test split)
-        ├── inter.npy    # UI interaction pairs
-        └── info.yaml    # Dataset metadata (user/item counts)
+
 ```
 
 ## Requirements
