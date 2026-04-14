@@ -1,7 +1,5 @@
 # NCMFR
 
-Graph Neural Network based Social Recommendation with Graph Structure Learning.
-
 ## Project Structure
 
 ```
