@@ -135,3 +135,17 @@ def calculate_jaccard(user1, user2, user_items_set):
     
     return jaccard
 
+
+def rbf_kernel(X, sigma=0.25):
+    dist = torch.cdist(X, X, p=2)**2
+    return torch.exp(-dist / (2 * sigma**2))
+
+def hsic_loss(X, Y, sigma=0.25):
+    n = X.shape[0]
+    if n <= 1:
+        return torch.tensor(0.0).to(X.device)
+    K_X = rbf_kernel(X, sigma)
+    K_Y = rbf_kernel(Y, sigma)
+    H = torch.eye(n, device=X.device) - (1.0 / n) * torch.ones((n, n), device=X.device)
+    K_X_centered = torch.mm(torch.mm(H, K_X), H)
+    return torch.trace(torch.mm(K_X_centered, K_Y)) / ((n - 1) ** 2)

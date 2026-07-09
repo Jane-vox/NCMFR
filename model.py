@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import torch 
 import torch.nn as nn 
 import torch.nn.functional as F
@@ -7,6 +7,7 @@ from utils import bpr_loss, reg_loss, InfoNCE
 from gsl_uu import GSL4uu
 from utils import _convert_sp_mat_to_sp_tensor
 import scipy.sparse as sp
+from utils import hsic_loss
 
 from encoder import *
 from module import *
@@ -30,19 +31,31 @@ class Inac_rec(nn.Module):
         self.gate = inter_denoise_gate(args)
         self.criterion = nn.BCELoss()
         self.sigmoid = nn.Sigmoid()
-       
-
     
     def train_soc(self, batch_user_pos_neg, ui_graph, uu_graph, user_feat=None, item_feat=None):
-        
         batch_user, batch_pos, batch_neg = batch_user_pos_neg[:, 0], batch_user_pos_neg[:, 1], batch_user_pos_neg[:, 2]
+        
+        # 接收统一的 5 个返回值
+        user_uu_emb, user_ui_emb, item_emb, user_emb_ego, item_emb_ego = self.encoder(ui_graph, uu_graph, user_feat, item_feat, train=True)
 
-        user_final_emb, user_ui_emb, item_emb, user_emb_ego, item_emb_ego = self.encoder(ui_graph, uu_graph, user_feat, item_feat)
-        rec_loss = bpr_loss(user_final_emb[batch_user], user_final_emb[batch_pos], user_final_emb[batch_neg])
+        # 消融 1：控制社交门控模块
+        if self.args.w_o_gate:
+            fused_user_emb = user_ui_emb + user_uu_emb
+        else:
+            fused_user_emb = self.gate(user_ui_emb, user_uu_emb)
+
+        # 推荐主任务损失计算（公式13）
+        rec_loss = bpr_loss(fused_user_emb[batch_user], fused_user_emb[batch_pos], fused_user_emb[batch_neg])
+
+        # 消融 2：控制 HSIC 非冗余约束模块
+        if self.args.w_o_hsic:
+            hsic_reg = torch.tensor(0.0).to(fused_user_emb.device)
+        else:
+            hsic_reg = hsic_loss(fused_user_emb[batch_user], user_uu_emb[batch_user], sigma=0.25)
 
         reg = reg_loss(user_emb_ego[batch_user], user_emb_ego[batch_pos], user_emb_ego[batch_neg])
 
-        return rec_loss*self.args.soc_lam + reg*self.args.weight_decay
+        return rec_loss * self.args.soc_lam + hsic_reg * self.args.hsic_lam + reg * self.args.weight_decay
     
     
     def train_cf(self, batch_user_pos_neg, ui_graph, uu_graph, user_feat=None, item_feat=None):
@@ -57,22 +70,26 @@ class Inac_rec(nn.Module):
         return cf_loss*self.args.cf_lam + reg*self.args.weight_decay
     
     def get_emb(self, ui_graph, uu_graph, user_feat, item_feat, users, temp_flag=False):
-        # 模型验证获取最终embedding
-        if temp_flag:
-            user_final_emb, item_emb, user_emb_ego = self.encoder(ui_graph, uu_graph, user_feat, item_feat, train=False, temp_flag=temp_flag)
-            return user_final_emb.detach()[users], item_emb.detach(), user_emb_ego.detach()
+        user_uu_emb, user_ui_emb, item_emb, user_emb_ego, _ = self.encoder(ui_graph, uu_graph, user_feat, item_feat, train=False)
+        
+        if self.args.w_o_gate:
+            fused_user_emb = user_ui_emb + user_uu_emb
         else:
-            user_final_emb, item_emb = self.encoder(ui_graph, uu_graph, user_feat, item_feat, train=False, temp_flag=temp_flag)
-            return user_final_emb.detach()[users], item_emb.detach()
+            fused_user_emb = self.gate(user_ui_emb, user_uu_emb)
+            
+        if temp_flag:
+            return fused_user_emb.detach()[users], item_emb.detach(), user_emb_ego.detach()
+        else:
+            return fused_user_emb.detach()[users], item_emb.detach()
     
 
     def get_whole_stru(self, unique_user, final_dele_indices, final_dele_sim, user_num, final_add_indices=None, final_add_sim=None):
         # 更新的social图
-        dele_graph = torch.sparse_coo_tensor(final_dele_indices.t(), final_dele_sim, (user_num, user_num)).cuda()
+        dele_graph = torch.sparse_coo_tensor(final_dele_indices.t(), final_dele_sim, (user_num, user_num)).to(self.args.device)
         dele_graph = torch.sparse.softmax(dele_graph, 1)
         # add_graph = torch.sparse_coo_tensor(final_add_indices.t(), final_add_sim, (user_num, user_num)).cuda()
         # add_graph = torch.sparse.softmax(add_graph, 1)
-        self_loop = torch.sparse_coo_tensor(torch.cat([unique_user.unsqueeze(0), unique_user.unsqueeze(0)]), torch.ones_like(unique_user), (self.num_users, self.num_users)).cuda()
+        self_loop = torch.sparse_coo_tensor(torch.cat([unique_user.unsqueeze(0), unique_user.unsqueeze(0)]), torch.ones_like(unique_user), (self.num_users, self.num_users)).to(self.args.device)
         # batch_graph = 1/2 * self_loop + 1/2 * (self.weight*add_graph + (1-self.weight)*dele_graph)
         # batch_graph = 1/2 * self_loop + 1/2 * (1-self.weight)*dele_graph
         batch_graph = dele_graph
@@ -86,7 +103,7 @@ class Inac_rec(nn.Module):
         unique_user = torch.LongTensor(np.sort(list(set(batch_user))))
         batch_graph = self.get_whole_stru(unique_user, final_dele_indices, final_dele_sim, final_add_indices, final_add_sim, self.num_users)
         uu_emb = torch.sparse.mm(batch_graph, user_emb)
-        user_final_emb = self.encoder.user_emb_map(torch.cat([user_emb_ego[batch_user], user_emb[batch_user], uu_emb[batch_user]], -1)) # user自身嵌入，UI图user嵌入，social图更新后user嵌入       
+        user_final_emb = self.encoder.user_emb_map(torch.cat([user_emb_ego[batch_user], user_emb[batch_user], uu_emb[batch_user]], -1)) # user自身嵌入，UI图user嵌入，social图更新后user嵌入
         rec_loss = bpr_loss(user_final_emb, item_emb[batch_pos], item_emb[batch_neg])
 
         mimic_loss = self.GSL4uu.mimic_learning(batch_act_user, batch_inact_user, user_emb, self.cluster_map, self.cluster_index)
@@ -108,7 +125,7 @@ class Inac_rec(nn.Module):
         link_target_nei = np.vstack(link_target_nei)
         target_nei = np.sort(list(set(target_nei)))
 
-        # target user的邻居的邻居   
+        # target user的邻居的邻居
         link_nei_nei = []
         target_nei_nei = []
         for u in target_nei:
@@ -143,8 +160,7 @@ class Inac_rec(nn.Module):
             all_links.append((all_nodes_map[one_link[0]], all_nodes_map[one_link[1]]))
         all_links = np.array(list(set(all_links)))
         all_links = all_links[np.argsort(all_links[:, 0])].T
-        batch_subgraph = torch.sparse_coo_tensor(all_links, [1]*all_links.shape[1], (all_nodes_num, all_nodes_num)).cuda() # 大的采样图
-
+        batch_subgraph = torch.sparse_coo_tensor(all_links, [1]*all_links.shape[1], (all_nodes_num, all_nodes_num)).to(self.args.device) # 大的采样图
         tn_nodes = np.sort(list(set(list(target) + list(target_nei))))
         tn_nodes_ = np.array([all_nodes_map[n] for n in tn_nodes])
         tn_nodes_num = len(tn_nodes)
@@ -158,14 +174,13 @@ class Inac_rec(nn.Module):
             tn_links.append((tn_nodes_map[all_nodes_map[one_link[0]]], tn_nodes_map[all_nodes_map[one_link[1]]]))
         tn_links = np.array(list(set(tn_links)))
         tn_links = tn_links[np.argsort(tn_links[:, 0])].T
-        tn_subgraph = torch.sparse_coo_tensor(tn_links, [1]*tn_links.shape[1], (tn_nodes_num, tn_nodes_num)).cuda()  # 小的采样图
-        
+        tn_subgraph = torch.sparse_coo_tensor(tn_links, [1]*tn_links.shape[1], (tn_nodes_num, tn_nodes_num)).to(self.args.device)  # 小的采样图
         ## T=0 ##
         # 第一轮的增删边涵盖了更广泛的节点集合，为了捕捉更多的结构信息和潜在的边。
         prob_dele_edge = dele_prob[all_nodes]
         prob_add_edge = add_prob[all_nodes]
         dele_final_indices, dele_final_sim, add_final_indices, add_final_sim = self.GSL4uu.new_stru(user_emb_ori, prob_dele_edge, prob_add_edge, all_nodes, cluster, batch_subgraph) 
-        # 增删边对稀疏矩阵进行更新，并归一化       
+        # 增删边对稀疏矩阵进行更新，并归一化
         dele_sim_t0 = torch.sparse_coo_tensor(dele_final_indices, dele_final_sim[0], (all_nodes_num, all_nodes_num))
         dele_sim_t0 = torch.sparse.softmax(dele_sim_t0, 1)
         add_sim_t0 = torch.sparse_coo_tensor(add_final_indices, add_final_sim[0], (all_nodes_num, len(cluster)))
@@ -180,7 +195,6 @@ class Inac_rec(nn.Module):
         user_emb_t0 = self.encoder.user_emb_map(torch.cat([user_emb_ego[all_nodes], ori_feat, user_emb_t0], -1)) 
 
         ## T=1 ##
-        # 第二轮的增删边则是在第一轮结果的基础上缩小了范围，专注于目标节点及其直接邻居，这样做可能是为了在局部范围内进一步优化结构。
         prob_dele_edge = dele_prob[tn_nodes]
         prob_add_edge = add_prob[tn_nodes]
         # user_emb_ori_ = user_emb_ori[all_nodes]
@@ -195,7 +209,7 @@ class Inac_rec(nn.Module):
             if tn_final_map[dele_final_indices[0, i]] in target:
                 dele_sele.append(i)
                 final_dele_indices.append([tn_final_map[dele_final_indices[0, i]], tn_final_map[dele_final_indices[1, i]]])
-        final_dele_indices = torch.LongTensor(final_dele_indices).cuda()
+        final_dele_indices = torch.LongTensor(final_dele_indices).to(self.args.device)
         final_dele_sim = dele_final_sim[0, dele_sele]
         
         add_sele = []
@@ -204,7 +218,7 @@ class Inac_rec(nn.Module):
             if tn_final_map[add_final_indices[0, i]] in target:
                 add_sele.append(i)
                 final_add_indices.append([tn_final_map[add_final_indices[0, i]], cluster_final_map[add_final_indices[1, i]]])
-        final_add_indices = torch.LongTensor(final_add_indices).cuda()
+        final_add_indices = torch.LongTensor(final_add_indices).to(self.args.device)
         final_add_sim = add_final_sim[0, add_sele]
         return final_dele_indices, final_dele_sim, final_add_indices, final_add_sim
    
@@ -226,7 +240,6 @@ class Inac_rec(nn.Module):
         return gsl_loss
 
     def re_struct(self, batch_user, uu_dict, user_emb_ori, dele_prob):
-        # social图增删边实现函数
         target = np.sort(list(set(batch_user)))
         # target user的邻居target_nei，包含的边link_target_nei
         link_target_nei = []
@@ -254,7 +267,7 @@ class Inac_rec(nn.Module):
             tn_links.append((tn_nodes_map[one_link[0]], tn_nodes_map[one_link[1]]))
         tn_links = np.array(list(set(tn_links)))
         tn_links = tn_links[np.argsort(tn_links[:, 0])].T
-        tn_subgraph = torch.sparse_coo_tensor(tn_links, [1]*tn_links.shape[1], (tn_nodes_num, tn_nodes_num)).cuda()
+        tn_subgraph = torch.sparse_coo_tensor(tn_links, [1]*tn_links.shape[1], (tn_nodes_num, tn_nodes_num)).to(self.args.device)
 
         prob_dele_edge = dele_prob[tn_nodes]
         
@@ -268,7 +281,7 @@ class Inac_rec(nn.Module):
             if tn_final_map[dele_final_indices[0, i]] in target:
                 dele_sele.append(i)
                 final_dele_indices.append([tn_final_map[dele_final_indices[0, i]], tn_final_map[dele_final_indices[1, i]]])
-        final_dele_indices = torch.LongTensor(final_dele_indices).cuda()
+        final_dele_indices = torch.LongTensor(final_dele_indices).to(self.args.device)
         final_dele_sim = dele_final_sim[0, dele_sele]
 
         return final_dele_indices, final_dele_sim
@@ -300,7 +313,7 @@ class Inac_rec(nn.Module):
         reg = reg_loss(user_emb_ego[batch_user], user_emb_ego[batch_pos], user_emb_ego[batch_neg])
 
         # rec_loss = bpr_loss(user_emb, all_layer_1[batch_pos], all_layer_1[batch_neg])
-        # infonce_loss = self._cl_loss(user_emb, F.normalize(all_layer_1[batch_user], dim=1))  # 拉近 融合cf信息的新user嵌入 和 原始uu图上的user嵌入
+        # infonce_loss = self._cl_loss(user_emb, F.normalize(all_layer_1[batch_user], dim=1))
 
         return bce_loss + reg*self.args.weight_decay
     
@@ -317,8 +330,8 @@ class Inac_rec(nn.Module):
     # def train_encoder2(self, batch_user_pos_neg, ui_graph, uu_graph):
     #     inputs, batch_pos, batch_neg = batch_user_pos_neg[:, 0], batch_user_pos_neg[:, 1], batch_user_pos_neg[:, 2]
 
-    #     mu, logvar = self.encoder2.encode(ui_graph)   # ui图    
-    #     s_mu, s_logvar = self.encoder2.social_encode(uu_graph)  # uu图
+    #     mu, logvar = self.encoder2.encode(ui_graph)   # ui鍥?   
+    #     s_mu, s_logvar = self.encoder2.social_encode(uu_graph)  # uu鍥?
     #     u_z = self.encoder2.reparameterize(mu[inputs], logvar[inputs]) 
     #     s_z = self.encoder2.reparameterize(s_mu[inputs], s_logvar[inputs])
         
@@ -339,3 +352,4 @@ class Inac_rec(nn.Module):
     #     return BCE + anneal * KLD
     '''       
     
+
