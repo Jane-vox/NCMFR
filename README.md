@@ -1,39 +1,44 @@
-# NCMFR
+﻿# NCMFR
 
 ## Project Structure
 
-```
+```text
 NCMFR/
-├── main.py           # Training entry point
-├── model.py          # Main model (Inac_rec)
-├── encoder.py        # Dual-graph encoder (UI + UU propagation)
-├── gsl_uu.py         # Graph structure learning for UU graph
-├── module.py         # Inter-denoise gate & multi-head attention
-├── layer.py          # MLP and LightGCN propagation layers
-├── dataloader.py     # Dataset loader (Yelp, Flickr)
-├── evaluation.py     # Metrics: NDCG, Hit, Recall, Precision
-├── utils.py          # Loss functions and utilities
-├── parse.py          # Hyperparameter configurations
-└── dataset/          # Data directory (not included)
-
+|-- main.py           # Training entry point
+|-- model.py          # Main model
+|-- encoder.py        # Dual-graph encoder
+|-- gsl_uu.py         # Graph structure learning for UU graph
+|-- module.py         # Gate and attention modules
+|-- layer.py          # MLP and LightGCN propagation layers
+|-- dataloader.py     # Dataset loader
+|-- evaluation.py     # Evaluation metrics
+|-- utils.py          # Loss functions and utilities
+|-- parse.py          # Hyperparameter configurations
+|-- preprocess.py     # Data preprocessing
+|-- data/             # Raw data files
+`-- dataset/          # Processed data files
 ```
 
 ## Requirements
 
-- Python 3.8+, PyTorch, NumPy, SciPy, PyYAML
+Python 3.8+, PyTorch, NumPy, SciPy, PyYAML, pandas
 
 ## Training
 
 ```bash
-# Train on Yelp (default)
-python main.py
+# Train on Yelp
+python main.py --param_set yelp --dataset yelp1
 
-# Train on Flickr: change `data` in parse.py to 'flickr', then run
-python main.py
+# Train on Flickr
+python main.py --param_set flickr --dataset flickr
+
+# Train on Douban-Book
+python main.py --param_set douban --dataset douban-book
 ```
 
 Each epoch consists of:
-1. **Encoder training** — BPR loss on social links + inter-domain denoising loss
-2. **Evaluation** — NDCG, Hit, Recall, Precision @10/20 on validation set
 
-Early stopping is based on Recall@10 (patience=20 by default). The best model and results are saved to `./output/<dataset>/<stamp>/`.
+1. Encoder training
+2. Evaluation on the validation set
+
+The best model and results are saved to `./output/<dataset>/<stamp>/`.
